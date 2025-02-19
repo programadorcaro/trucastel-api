@@ -176,7 +176,7 @@ function getNextPlayer(state: GameState, currentPlayer: string): string {
 }
 
 // Routes
-app.post("/api/v1/match/create", async (c) => {
+app.post("/v1/match/create", async (c) => {
   try {
     const matchId = crypto.randomUUID();
     const body = await c.req.json();
@@ -211,7 +211,7 @@ app.post("/api/v1/match/create", async (c) => {
   }
 });
 
-app.get("/api/v1/match/:matchId", async (c) => {
+app.get("/v1/match/:matchId", async (c) => {
   try {
     const matchId = c.req.param("matchId");
 
@@ -239,7 +239,7 @@ app.get("/api/v1/match/:matchId", async (c) => {
   }
 });
 
-app.get("/api/v1/match/:matchId/plays", async (c) => {
+app.get("/v1/match/:matchId/plays", async (c) => {
   try {
     const matchId = c.req.param("matchId");
 
@@ -263,7 +263,7 @@ app.get("/api/v1/match/:matchId/plays", async (c) => {
   }
 });
 
-app.get("/api/v1/:matchId/:userId/:cardvalue/:suit", async (c) => {
+app.get("/v1/:matchId/:userId/:cardvalue/:suit", async (c) => {
   try {
     const matchId = c.req.param("matchId");
     const userId = c.req.param("userId");
@@ -339,7 +339,7 @@ app.get("/api/v1/:matchId/:userId/:cardvalue/:suit", async (c) => {
   }
 });
 
-app.get("/api/v1/matches/active", async (c) => {
+app.get("/v1/matches/active", async (c) => {
   try {
     const activeMatches = Object.entries(matches)
       .filter(([_, match]) => !match.state.gameComplete)
