@@ -1,8 +1,13 @@
+import dotenv from "dotenv";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { Server } from "socket.io";
 import { z } from "zod";
+import { handle } from "hono/vercel";
+
+// Configure dotenv at the start of your application
+dotenv.config();
 
 // Zod Schemas
 const CardSchema = z.object({
@@ -55,13 +60,15 @@ type Match = {
 // Global state
 const matches: Record<string, Match> = {};
 
-const app = new Hono();
+const app = new Hono().basePath("/api");
 app.use("/api/*", cors());
+
+const port = process.env.PORT as unknown as number;
 
 // Create server instance
 const server = serve({
   fetch: app.fetch,
-  port: 3333,
+  port,
 });
 
 // Initialize Socket.IO
@@ -357,4 +364,12 @@ app.get("/", (c) => {
   return c.text("Hello Hono!");
 });
 
-console.log(`Server is running on http://localhost:3333`);
+const handler = handle(app);
+
+export const GET = handler;
+export const POST = handler;
+export const PATCH = handler;
+export const PUT = handler;
+export const OPTIONS = handler;
+
+console.log(`Server is running on http://localhost:${process.env.PORT}`);
