@@ -2,12 +2,19 @@ import dotenv from "dotenv";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { Server } from "socket.io";
 import { z } from "zod";
 import { handle } from "hono/vercel";
+import { ConvexHttpClient } from "convex/browser";
+import { api } from "../convex/_generated/api.js";
+import type { Id } from "../convex/_generated/dataModel.js";
 
 // Configure dotenv at the start of your application
 dotenv.config();
+
+// Validate that the environment variable exists
+if (!process.env.CONVEX_URL) {
+  throw new Error("CONVEX_URL environment variable is not set");
+}
 
 // Zod Schemas
 const CardSchema = z.object({
@@ -71,50 +78,10 @@ const server = serve({
   port,
 });
 
-// Initialize Socket.IO
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-  },
-});
-
-// WebSocket connection handling
-io.on("connection", (socket) => {
-  console.log("Client connected");
-
-  // Allow clients to subscribe to specific match updates
-  socket.on("subscribeToMatch", (matchId: string) => {
-    socket.join(matchId);
-    console.log(`Client subscribed to match ${matchId}`);
-  });
-
-  socket.on("unsubscribeFromMatch", (matchId: string) => {
-    socket.leave(matchId);
-    console.log(`Client unsubscribed from match ${matchId}`);
-  });
-
-  socket.on("disconnect", () => {
-    console.log("Client disconnected");
-  });
-});
-
 // Helper function to emit match updates
 function emitMatchUpdate(matchId: string, match: Match) {
   console.log("Emitting match update for matchId:", matchId);
   console.log("Match data being emitted:", {
-    matchId,
-    state: match.state,
-    summary: {
-      currentRound: match.state.currentRound,
-      currentTurn: match.state.currentTurn,
-      roundWinners: match.state.roundWinners,
-      gameWinner: match.state.winner,
-      isComplete: match.state.gameComplete,
-    },
-  });
-
-  io.to(matchId).emit("matchUpdate", {
     matchId,
     state: match.state,
     summary: {
@@ -175,34 +142,26 @@ function getNextPlayer(state: GameState, currentPlayer: string): string {
   return currentPlayer === team2.player1 ? team1.player2 : team1.player1;
 }
 
+const convex = new ConvexHttpClient(process.env.CONVEX_URL);
+
 // Routes
 app.post("/v1/match/create", async (c) => {
   try {
-    const matchId = crypto.randomUUID();
     const body = await c.req.json();
-
-    // Validate request body with Zod
     const validatedBody = CreateMatchBodySchema.parse(body);
 
-    matches[matchId] = {
-      state: {
-        team1: validatedBody.team1,
-        team2: validatedBody.team2,
-        currentTurn: validatedBody.team1.player1,
-        currentRound: "round1",
-        roundWinners: {},
-      },
-      rounds: {
-        round1: [],
-        round2: [],
-        round3: [],
-      },
-    };
+    const matchId = await convex.mutation(api.matches.create, {
+      team1_player1: validatedBody.team1.player1,
+      team1_player2: validatedBody.team1.player2,
+      team2_player1: validatedBody.team2.player1,
+      team2_player2: validatedBody.team2.player2,
+      current_turn: validatedBody.team1.player1, // Start with team1's player1
+      current_round: "round1",
+      is_complete: false,
+    });
 
-    // Emit update for new match
-    emitMatchUpdate(matchId, matches[matchId]);
-
-    return c.json({ matchId, state: matches[matchId] });
+    const match = await convex.query(api.matches.get, { id: matchId });
+    return c.json({ matchId, state: match });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return c.json({ error: error.errors }, 400);
@@ -213,27 +172,56 @@ app.post("/v1/match/create", async (c) => {
 
 app.get("/v1/match/:matchId", async (c) => {
   try {
-    const matchId = c.req.param("matchId");
+    const matchId = c.req.param("matchId") as Id<"matches">;
+    const match = await convex.query(api.matches.get, { id: matchId });
 
-    // Validate match exists
-    if (!matches[matchId]) {
+    if (!match) {
       return c.json({ error: "Match not found" }, 404);
     }
 
-    const match = matches[matchId];
+    const plays = await convex.query(api.plays.getByMatch, { matchId });
 
-    return c.json({
+    // Transform match data to match API format
+    const response = {
       matchId,
-      state: match.state,
-      rounds: match.rounds,
-      summary: {
-        currentRound: match.state.currentRound,
-        currentTurn: match.state.currentTurn,
-        roundWinners: match.state.roundWinners,
-        gameWinner: match.state.winner,
-        isComplete: match.state.gameComplete,
+      state: {
+        team1: {
+          player1: match.team1_player1,
+          player2: match.team1_player2,
+        },
+        team2: {
+          player1: match.team2_player1,
+          player2: match.team2_player2,
+        },
+        currentTurn: match.current_turn,
+        currentRound: match.current_round,
+        roundWinners: {
+          round1: match.round1_winner,
+          round2: match.round2_winner,
+          round3: match.round3_winner,
+        },
+        winner: match.game_winner,
+        gameComplete: match.is_complete,
       },
-    });
+      rounds: {
+        round1: plays.filter((p) => p.round === "round1"),
+        round2: plays.filter((p) => p.round === "round2"),
+        round3: plays.filter((p) => p.round === "round3"),
+      },
+      summary: {
+        currentRound: match.current_round,
+        currentTurn: match.current_turn,
+        roundWinners: {
+          round1: match.round1_winner,
+          round2: match.round2_winner,
+          round3: match.round3_winner,
+        },
+        gameWinner: match.game_winner,
+        isComplete: match.is_complete,
+      },
+    };
+
+    return c.json(response);
   } catch (error) {
     return c.json({ error: "Invalid request" }, 400);
   }
@@ -241,21 +229,49 @@ app.get("/v1/match/:matchId", async (c) => {
 
 app.get("/v1/match/:matchId/plays", async (c) => {
   try {
-    const matchId = c.req.param("matchId");
+    const matchId = c.req.param("matchId") as Id<"matches">;
+    const plays = await convex.query(api.plays.getByMatch, { matchId });
 
-    // Validate match exists
-    if (!matches[matchId]) {
+    if (!plays) {
       return c.json({ error: "Match not found" }, 404);
     }
-
-    const match = matches[matchId];
 
     return c.json({
       matchId,
       plays: {
-        round1: match.rounds.round1,
-        round2: match.rounds.round2,
-        round3: match.rounds.round3,
+        round1: plays
+          .filter((p) => p.round === "round1")
+          .map((p) => ({
+            id: p._id,
+            userId: p.user_id,
+            timestamp: p.timestamp,
+            card: {
+              value: p.card_value,
+              suit: p.card_suit,
+            },
+          })),
+        round2: plays
+          .filter((p) => p.round === "round2")
+          .map((p) => ({
+            id: p._id,
+            userId: p.user_id,
+            timestamp: p.timestamp,
+            card: {
+              value: p.card_value,
+              suit: p.card_suit,
+            },
+          })),
+        round3: plays
+          .filter((p) => p.round === "round3")
+          .map((p) => ({
+            id: p._id,
+            userId: p.user_id,
+            timestamp: p.timestamp,
+            card: {
+              value: p.card_value,
+              suit: p.card_suit,
+            },
+          })),
       },
     });
   } catch (error) {
@@ -265,71 +281,83 @@ app.get("/v1/match/:matchId/plays", async (c) => {
 
 app.get("/v1/:matchId/:userId/:cardvalue/:suit", async (c) => {
   try {
-    const matchId = c.req.param("matchId");
+    const matchId = c.req.param("matchId") as Id<"matches">;
     const userId = c.req.param("userId");
     const cardValue = parseInt(c.req.param("cardvalue"));
     const suit = c.req.param("suit");
 
-    // Validate match exists
-    if (!matches[matchId]) {
+    const match = await convex.query(api.matches.get, { id: matchId });
+    if (!match) {
       return c.json({ error: "Match not found" }, 404);
     }
 
-    // Validate card data with Zod
+    // Validate card data
     const validatedCard = CardSchema.parse({
       value: cardValue,
       suit: suit,
     });
 
-    const match = matches[matchId];
-    const { state, rounds } = match;
-
     // Validate it's the player's turn
-    if (state.currentTurn !== userId) {
+    if (match.current_turn !== userId) {
       return c.json({ error: "Not your turn" }, 400);
     }
 
-    const play: Play = {
-      id: crypto.randomUUID(),
-      userId,
+    // Create the play
+    await convex.mutation(api.plays.create, {
+      match_id: matchId as Id<"matches">,
+      user_id: userId,
+      round: match.current_round,
       timestamp: Date.now(),
-      card: validatedCard,
-    };
+      card_value: validatedCard.value,
+      card_suit: validatedCard.suit,
+    });
 
-    const currentRoundPlays = rounds[state.currentRound];
-    currentRoundPlays.push(play);
+    // Get updated match state
+    const updatedMatch = await convex.query(api.matches.get, {
+      id: matchId as Id<"matches">,
+    });
+    const plays = await convex.query(api.plays.getByMatch, {
+      matchId: matchId as Id<"matches">,
+    });
 
-    // Update next turn
-    state.currentTurn = getNextPlayer(state, userId);
-
-    // Check if round is complete
-    if (currentRoundPlays.length === 4) {
-      const roundWinner = determineRoundWinner(currentRoundPlays, state);
-      state.roundWinners![state.currentRound] = roundWinner;
-
-      // Move to next round
-      if (state.currentRound === "round1") {
-        state.currentRound = "round2";
-      } else if (state.currentRound === "round2") {
-        state.currentRound = "round3";
-      }
-
-      // Check for game winner
-      const gameWinner = determineGameWinner(rounds, state);
-      if (gameWinner) {
-        state.winner = gameWinner;
-        state.gameComplete = true;
-      }
+    if (!updatedMatch || !plays) {
+      return c.json({ error: "Match or plays not found" }, 404);
     }
 
-    // Emit update after play
-    emitMatchUpdate(matchId, matches[matchId]);
-
     return c.json({
-      match: matches[matchId],
-      currentRound: state.currentRound,
-      roundWinners: state.roundWinners,
-      winner: state.winner,
+      match: {
+        state: {
+          team1: {
+            player1: updatedMatch.team1_player1,
+            player2: updatedMatch.team1_player2,
+          },
+          team2: {
+            player1: updatedMatch.team2_player1,
+            player2: updatedMatch.team2_player2,
+          },
+          currentTurn: updatedMatch.current_turn,
+          currentRound: updatedMatch.current_round,
+          roundWinners: {
+            round1: updatedMatch.round1_winner,
+            round2: updatedMatch.round2_winner,
+            round3: updatedMatch.round3_winner,
+          },
+          winner: updatedMatch.game_winner,
+          gameComplete: updatedMatch.is_complete,
+        },
+        rounds: {
+          round1: plays.filter((p) => p.round === "round1"),
+          round2: plays.filter((p) => p.round === "round2"),
+          round3: plays.filter((p) => p.round === "round3"),
+        },
+      },
+      currentRound: updatedMatch.current_round,
+      roundWinners: {
+        round1: updatedMatch.round1_winner,
+        round2: updatedMatch.round2_winner,
+        round3: updatedMatch.round3_winner,
+      },
+      winner: updatedMatch.game_winner,
     });
   } catch (error) {
     if (error instanceof z.ZodError) {
@@ -340,23 +368,8 @@ app.get("/v1/:matchId/:userId/:cardvalue/:suit", async (c) => {
 });
 
 app.get("/v1/matches/active", async (c) => {
-  try {
-    const activeMatches = Object.entries(matches)
-      .filter(([_, match]) => !match.state.gameComplete)
-      .map(([matchId, match]) => ({
-        matchId,
-        state: match.state,
-        summary: {
-          currentRound: match.state.currentRound,
-          currentTurn: match.state.currentTurn,
-          roundWinners: match.state.roundWinners,
-        },
-      }));
-
-    return c.json({ matches: activeMatches });
-  } catch (error) {
-    return c.json({ error: "Invalid request" }, 400);
-  }
+  const activeMatches = await convex.query(api.matches.getActive);
+  return c.json({ matches: activeMatches });
 });
 
 // Basic health check route
